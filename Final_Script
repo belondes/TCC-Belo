@@ -1,0 +1,202 @@
+""" Ajuste das fases de todas as épocas para todos os satélites
+Resumo das variáveis:
+file_name => o nome do arquivo de entrada
+vars      => um dicionário com nomes das variáveis de cada tipo de satélite
+first     => é o índice da linha de registro da primeira época
+epoch     => é o índice da linha de registro da época sobre análise
+h_list    => uma lista com todas as linhas do cabeçalho
+version   => a versão do arquivo RINEX lido
+ftype     => o tipo do arquivo lido
+p_line    => garante que nomes de variáveis em mais de uma linha sejam unidas
+r_vars    => um dicionário que relaciona os índices das fases de cada tipo 
+             de satélite com os índices de seus respectivos dopplers
+k         => constante aplicada a fase se houver perda de ciclo
+stl_m     => um dicionário com memória das fases acumuladas e dopplers
+             de satélites observados na época anterior
+prev      => a data da época anterior
+curr      => a data da época sobre análise
+"""
+
+from datetime import datetime, timedelta
+# Arquivo em análise
+file_name = "nome_do_arquivo"
+
+def is_float(n):
+  try:
+    float(n)
+    return True
+  except ValueError:
+    return False
+
+vars = {}
+def make_header(target):
+  """ Lê cabeçalho na origem, escreve no destino e decora quais são as variaveis 
+  """
+  with open(file_name, "r") as source:
+    first = None
+    is_header_line = True
+    h_list = []
+    for i, line in enumerate(source): # Verificamos se o arquivo atende aos requisitos do script
+      if i == 0:
+        if not ("RINEX VERSION / TYPE" in line[60:]):
+          print("Este não parece ser um arquivo do tipo rinex.")
+          exit()
+        version, ftype = line.split()[:2]
+        if float(version) < 3.0:
+          print("Este script requer arquivos da versão 3 ou superior.")
+          exit()
+        if not "OBSERVATION" in ftype:
+          print("Este script lida com dados de observação.")
+          exit()
+      if is_header_line:
+        h_list.append(line)
+        if "END OF HEADER" in line[60:]:
+          is_header_line = False
+      elif line[0] == '>':
+        if first is None:
+          first = i
+          break
+      else:
+        print("Arquivo rinex parece mal formado (após o cabeçalho deveria existir uma época).")
+        exit()
+  p_line = None
+  for i, line in enumerate(h_list):
+    line = line.replace("\n","")
+    endl = "\n" if i != 0 else ""
+    target.write(endl + line)
+# Precisamos de OBS TYPES para garantir a leitura e escrita correta
+    if "SYS / # / OBS TYPES" in line[60:]: 
+      var_names = line[:60].split()
+      if p_line is None:
+        var_key = var_names[0]
+        var_len = int(var_names[1])
+        if var_len != len(var_names) - 2:
+          p_line = var_names[2:]
+        else:
+          vars[var_key] = var_names[2:]
+      else:
+        p_line += var_names
+        if len(p_line) == var_len:
+          vars[var_key] = list(p_line)
+          p_line = None
+        elif len(p_line) > var_len:
+          print("Arquivo rinex parece mal formado (verifique o número de variáveis em OBS TYPES).")
+          exit()
+  return first
+
+# Criamos o arquivo de saída preenchido com o cabeçalho
+with open("output_"+file_name,"w") as target:
+  first = make_header(target)
+
+# Precisamos relacionar variáveis de doppler com suas fases
+r_vars = {}
+for key in vars:
+  r_vars[key] = {"fase":[],"doppler":[]}
+  for i, var_name in enumerate(vars[key]):
+    if var_name[0] == "L":
+      r_vars[key]["fase"].append(i)
+      if "D"+var_name[1:] in vars[key]:
+        r_vars[key]["doppler"].append(vars[key].index("D"+var_name[1:]))
+      else: # Mapeamos com -1 o caso onde temos o registro de uma fase sem doppler
+        r_vars[key]["doppler"].append(-1) 
+
+# Impressão apenas para fins de depuração
+# import pprint
+# pp = pprint.PrettyPrinter(indent=4)
+# pp.pprint(r_vars)
+
+# Ler a primeira época na origem, atualizar fases e gravar no destino
+k = 10000000  # As fases de todos os satélites inicializam no valor constante 10.000.000
+epoch = first
+prev = datetime(1978,2,22)
+stl_m = {}
+with open(file_name, "r") as source:
+  with open("output_"+file_name, "a") as target:
+    for i, line in enumerate(source):
+      line = line.replace("\n","")
+      if i < first:
+        pass
+      elif i == first:
+        target.write("\n" + line)
+        s = line.split()
+        n_sat = int(s[8])
+        year, month, day, hour, minute = [int(value) for value in s[1:6]]
+        second, microsecond = [int(value) for value in s[6].split(".")]
+        prev = datetime(year, month, day, hour, minute, second, microsecond//10)
+      elif i > first and i <= first + n_sat:
+        key = line[0]
+        sat = line[:3]
+        data = line[3:]
+        target.write("\n" + sat)
+        for j, var_name in enumerate(vars[key]):
+          r = r_vars[key]
+          if j in r["fase"]:
+            d_idx = r["doppler"][r["fase"].index(j)]
+            if d_idx != -1:
+              doppler = data[d_idx*16:(d_idx+1)*16-2]
+              if is_float(doppler):
+                target.write("%14.3f  " % (k))
+                stl_m[(sat,var_name)] = (k, float(doppler))
+                continue
+          #target.write(data[j*16:(j+1)*16])
+          target.write(data[j*16:(j+1)*16-2] + "  ")  # Para descartar todos os SLI e LLI use esta linha no lugar da anterior
+      else:
+        epoch = i
+        break
+
+# Ler todas as demais épocas e gravar no destino
+cycle_slip = False
+with open(file_name, "r") as source:
+  with open("output_"+file_name, "a") as target:
+    stl = {}
+    for i, line in enumerate(source):
+      line = line.replace("\n","")
+      if i < epoch:
+        pass
+      elif i == epoch and len(line) > 0 and line[0] == '>':
+        target.write("\n" + line)
+        s = line.split()
+        n_sat = int(s[8])
+        year, month, day, hour, minute = [int(value) for value in s[1:6]]
+        second, microsecond = [int(value) for value in s[6].split(".")]
+        # Microsegundo em python tem resolução de 6 dígitos, no rinex são 7
+        curr = datetime(year, month, day, hour, minute, second, microsecond//10)
+        cycle_slip = curr - prev >= timedelta(seconds=1, microseconds=500000)
+      elif i > epoch and i <= epoch + n_sat:
+        key = line[0]
+        sat = line[:3]
+        data = line[3:]
+        target.write("\n" + sat)
+        if not key in vars:
+          print(f"Erro ao processar a linha {i+1}. Indicador do tipo de observação inválido.")
+          print(line)
+          break
+        for j, var_name in enumerate(vars[key]):
+          r = r_vars[key]
+          if j in r["fase"]:
+            d_idx = r["doppler"][r["fase"].index(j)]
+            if d_idx != -1:
+              curr_doppler = data[d_idx*16:(d_idx+1)*16-2]
+              if is_float(curr_doppler):
+                curr_doppler = float(curr_doppler)
+                if (sat,var_name) in stl_m and not cycle_slip:
+                  prev_fase, prev_doppler = stl_m[(sat,var_name)]
+                  curr_fase = prev_fase - (prev_doppler + curr_doppler) / 2
+                  target.write("%14.3f  " % (curr_fase))
+                  stl[(sat,var_name)] = (curr_fase, float(curr_doppler))
+                else:
+                  target.write("%14.3f  " % (k))
+                  stl[(sat,var_name)] = (k, float(curr_doppler))
+                continue
+          #target.write(data[j*16:(j+1)*16])
+          target.write(data[j*16:(j+1)*16-2] + "  ")
+        if i == epoch + n_sat:
+          stl_m = dict(stl)
+          prev = curr
+          epoch += n_sat + 1 
+      else:
+        print(f"Processamento terminado após a época {prev}.")
+        if line:
+          print(f"A última linha de dado é {i+1}:")
+          print(line)
+        break
