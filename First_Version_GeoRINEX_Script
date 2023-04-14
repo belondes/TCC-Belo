@@ -1,0 +1,125 @@
+# Versão 1, Script - Reconstruindo a Fase da Portadora
+!pip install georinex # Instalando o pacote georinex
+
+from datetime import datetime, timedelta   # Importando as bibliotecas
+from math import isnan
+import georinex as gr
+
+file_name = "nome_do_arquivo.22o" # Arquivo em análise
+
+# Função para escrita de cabeçalho atualizado
+vars = {}
+def makeHeader(file):
+  input = open(file_name, "r")
+  first, second = None, None
+  header = True
+  h_list = []
+  for line in input:
+    if header:
+      h_list.append(line)
+    if "END OF HEADER" in line[60:]:
+      header = False
+    if line[0] == '>':
+      if first is None:
+        first = line
+      else:
+        second = line
+        break
+  s = second.split()
+  t = (int(s[1]), int(s[2]), int(s[3]), int(s[4]), int(s[5]), float(s[6]))
+  for line in h_list:
+    if "TIME OF FIRST OBS" in line[60:]:
+      linedate = "%6d%6d%6d%6d%6d%13.7f%8s         TIME OF FIRST OBS\n"
+      system = line[43:51]
+      linedate %= (t[0], t[1], t[2], t[3], t[4], t[5], system)
+      file.write(linedate)
+    elif "SYS / # / OBS TYPES" in line[60:]:  # Precisamos de OBS TYPES
+      file.write(line)
+      words = line[:60].split()
+      var_name = words[0]
+      var_size = int(words[1])
+      if var_size != len(words) - 2:
+        print("Observation type has an interpretation error:")
+        print(line)
+      vars[var_name] = words[2:]
+    else:
+      file.write(line)
+
+# Função de análise para cada época
+sv_l = {} # Fase dos satélites analisados
+def filter(t0, t2, file):
+  dat = gr.load(file_name, tlim=[t0 , t2])  # Temos as épocas t0 e t1
+  var = list(dat.data_vars.keys())  # E os nomes de suas variáveis
+  diff = 0
+  obs = []
+  # Para cada satélite na época de análise
+  for i, sat in enumerate(dat.sv):
+    s_var = vars[dat.sv.data[i][0]] # Recuperamos a lista de variáveis para o satélite em questão
+    s_obs = dat.sv.data[i]
+    # Para todas as variáveis
+    for j in range(len(s_var) // 4):
+      c_var, l_var, d_var, i_var = s_var[j*4+0], s_var[j*4+1], s_var[j*4+2], s_var[j*4+3]
+      if not ((dat.sv.data[i],l_var) in sv_l):  # Ao descobrir um satélite o inicializamos
+        sv_l[(dat.sv.data[i],l_var)] = 10000000.0
+      # Testamos se houve ausência de sinal de um dos satélites em época anterior
+      if isnan(dat.data_vars[d_var].data[0, i]) and \
+        not isnan(dat.data_vars[d_var].data[1, i]):
+        sv_l[(dat.sv.data[i],l_var)] = 10000000.0
+        s_obs += "%14.3f  %14.3f  %14.3f  %14.3f  " % (dat.data_vars[c_var][1, i],
+                                                       sv_l[(dat.sv.data[i],l_var)],
+                                                       dat.data_vars[d_var][1, i],
+                                                       dat.data_vars[i_var][1, i])
+      if not isnan(dat.data_vars[d_var].data[0, i]) and \
+        not isnan(dat.data_vars[d_var].data[1, i]):
+        sv_l[(dat.sv.data[i],l_var)] -= (dat.data_vars[d_var][0, i] + dat.data_vars[d_var][1, i])/2
+        s_obs += "%14.3f  %14.3f  %14.3f  %14.3f  " % (dat.data_vars[c_var][1, i],
+                                                       sv_l[(dat.sv.data[i],l_var)],
+                                                       dat.data_vars[d_var][1, i],
+                                                       dat.data_vars[i_var][1, i])
+      if not isnan(dat.data_vars[d_var].data[0, i]) and \
+        isnan(dat.data_vars[d_var].data[1, i]):
+        diff -= 1
+      if isnan(dat.data_vars[d_var].data[0, i]) and \
+        isnan(dat.data_vars[d_var].data[1, i]):
+        s_obs += " " * (16*4)
+    if len(s_obs.split()) > 1:
+      obs.append(s_obs + "\n")
+  dt = str(dat.time.data[1])
+  fmt = "> %s %s %s %s %s %s 0 %2d\n"
+  epoch = fmt % (dt[0:4],dt[5:7],dt[8:10],dt[11:13],dt[14:16],dt[17:27], len(dat.sv) + diff )
+  file.write( epoch )
+  for item in obs:
+    file.write( item )
+
+# Busca das épocas inicial e final no arquivo
+with open(file_name) as f:
+    start = None
+    end = None
+    for line in f:
+        if len(line) > 0 and line[0] == '>':
+            if start is None:
+                start = line
+            else:
+                end = line
+
+s, e = start.split(), end.split()
+start = "%s-%02d-%02dT%02d:%02d:%02d" % (s[1], int(s[2]), int(s[3]), int(s[4]), int(s[5]), float(s[6]))
+end   = "%s-%02d-%02dT%02d:%02d:%02d" % (e[1], int(e[2]), int(e[3]), int(e[4]), int(e[5]), float(e[6]))
+
+# Prepara o arquivo de saída
+output = open("output_{}".format(file_name),"w")
+makeHeader(output)
+
+# Loop de execução época por época
+epoch = 0
+while start != end:
+    epoch += 1
+    t0 = datetime.fromisoformat(start)
+    t1 = t0 + timedelta(seconds=1)
+    t2 = t1 + timedelta(seconds=1)
+    next = t2.isoformat()
+    filter(start, next, output)
+    start = t1.isoformat()
+
+# Fechar o arquivo de saída
+output.close()
